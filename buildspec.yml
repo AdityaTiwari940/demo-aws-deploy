@@ -1,0 +1,80 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "us-west-2"
+    S3_BUCKET: "my-artifact-bucket"
+    LAMBDA_ROLE_ARN: "arn:aws:iam::<account-id>:role/lambda-basic-execution"
+    GLUE_ROLE_ARN: "arn:aws:iam::<account-id>:role/glue-job-execution"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+    commands:
+      - echo "Installing AWS CLI and packaging tools..."
+      - pip install boto3 awscli -q
+
+  build:
+    commands:
+      - echo "=== Starting multi-Lambda + multi-Glue deployment ==="
+
+      - echo "Packaging all Lambda functions..."
+      - mkdir -p build/lambda_zips
+
+      # Loop through all Lambda directories and zip each one
+      - |
+        for dir in lambda/*/ ; do
+          func_name=$(basename "$dir")
+          echo "Processing Lambda: $func_name"
+          cd "$dir"
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt -t . > /dev/null
+          fi
+          zip -r "../../build/lambda_zips/${func_name}.zip" . > /dev/null
+          cd - > /dev/null
+
+          echo "Checking if Lambda $func_name exists..."
+          if aws lambda get-function --function-name "$func_name" > /dev/null 2>&1; then
+            echo "Updating existing Lambda: $func_name"
+            aws lambda update-function-code --function-name "$func_name" --zip-file fileb://build/lambda_zips/${func_name}.zip
+          else
+            echo "Creating new Lambda function: $func_name"
+            aws lambda create-function \
+              --function-name "$func_name" \
+              --runtime python3.9 \
+              --role $LAMBDA_ROLE_ARN \
+              --handler app.lambda_handler \
+              --zip-file fileb://build/lambda_zips/${func_name}.zip \
+              --timeout 30
+          fi
+        done
+
+      - echo "Uploading Glue scripts to S3 and updating jobs..."
+      - mkdir -p build/glue_scripts
+
+      - |
+        for script in glue/*.py; do
+          job_name=$(basename "$script" .py)
+          s3_path="s3://$S3_BUCKET/glue-scripts/${job_name}.py"
+          echo "Uploading $script to $s3_path"
+          aws s3 cp "$script" "$s3_path"
+
+          if aws glue get-job --job-name "$job_name" > /dev/null 2>&1; then
+            echo "Updating existing Glue job: $job_name"
+            aws glue update-job --job-name "$job_name" \
+              --job-update "{\"Command\": {\"Name\": \"glueetl\", \"ScriptLocation\": \"$s3_path\"}}"
+          else
+            echo "Creating new Glue job: $job_name"
+            aws glue create-job \
+              --name "$job_name" \
+              --role "$GLUE_ROLE_ARN" \
+              --command "{\"Name\": \"glueetl\", \"ScriptLocation\": \"$s3_path\"}" \
+              --glue-version "3.0" \
+              --max-capacity 2
+          fi
+        done
+
+  post_build:
+    commands:
+      - echo "=== Deployment Complete ==="
