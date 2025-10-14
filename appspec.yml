@@ -1,8 +1,0 @@
-version: 0.0
-Resources:
-  - MyLambda:
-      Type: AWS::Lambda::Function
-      Properties:
-        Name: MyCICDLambda
-        Alias: live
-        CurrentVersion: 1
