@@ -3,78 +3,74 @@ version: 0.2
 env:
   variables:
     AWS_DEFAULT_REGION: "us-west-2"
-    S3_BUCKET: "my-artifact-bucket"
-    LAMBDA_ROLE_ARN: "arn:aws:iam::<account-id>:role/lambda-basic-execution"
-    GLUE_ROLE_ARN: "arn:aws:iam::<account-id>:role/glue-job-execution"
+    CODEDEPLOY_APPLICATION_NAME: "cr-deploy-app"
+    CODEDEPLOY_DEPLOYMENT_GROUP: "lambda-glue-dg"
+    LAMBDA_ALIAS: "live"
 
 phases:
   install:
     runtime-versions:
-      python: 3.10
+      python: 3.9
     commands:
-      - echo "Installing AWS CLI and packaging tools..."
-      - pip install boto3 awscli -q
+      - pip install --upgrade pip
+      - pip install awscli --upgrade
 
   build:
     commands:
-      - echo "=== Starting multi-Lambda + multi-Glue deployment ==="
-
-      - echo "Packaging all Lambda functions..."
-      - mkdir -p build/lambda_zips
-
-      # Loop through all Lambda directories and zip each one
+      - mkdir -p build
+      - APP_RESOURCES=""
       - |
-        for dir in lambda/*/ ; do
-          func_name=$(basename "$dir")
-          echo "Processing Lambda: $func_name"
-          cd "$dir"
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt -t . > /dev/null
-          fi
-          zip -r "../../build/lambda_zips/${func_name}.zip" . > /dev/null
-          cd - > /dev/null
+        for d in lambda/*/ ; do
+          func_dir="${d%/}"
+          func_name=$(basename "$func_dir")
+          echo "Processing $func_name"
 
-          echo "Checking if Lambda $func_name exists..."
-          if aws lambda get-function --function-name "$func_name" > /dev/null 2>&1; then
-            echo "Updating existing Lambda: $func_name"
-            aws lambda update-function-code --function-name "$func_name" --zip-file fileb://build/lambda_zips/${func_name}.zip
-          else
-            echo "Creating new Lambda function: $func_name"
-            aws lambda create-function \
-              --function-name "$func_name" \
-              --runtime python3.9 \
-              --role $LAMBDA_ROLE_ARN \
-              --handler app.lambda_handler \
-              --zip-file fileb://build/lambda_zips/${func_name}.zip \
-              --timeout 30
+          if [ -f "$func_dir/requirements.txt" ]; then
+            pip install -r "$func_dir/requirements.txt" -t "$func_dir"
           fi
+
+          zip_file="build/${func_name}.zip"
+          (cd "$func_dir" && zip -r "../../$zip_file" .) >/dev/null
+
+          # Update code (puts code into $LATEST)
+          aws lambda update-function-code --function-name "$func_name" --zip-file "fileb://$zip_file" >/tmp/update_${func_name}.json
+
+          # find current alias version (before publish)
+          CUR_ALIAS_VER=$(aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --query "FunctionVersion" --output text 2>/dev/null || echo "")
+          if [ -z "$CUR_ALIAS_VER" ] || [ "$CUR_ALIAS_VER" = "None" ]; then
+            CUR_ALIAS_VER="0"
+          fi
+
+          # Publish new version from $LATEST
+          NEW_VER=$(aws lambda publish-version --function-name "$func_name" --query "Version" --output text)
+          echo "Published $func_name -> $NEW_VER"
+
+          # Ensure alias exists (if not, create it pointing to previous version or new if none)
+          if ! aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" >/dev/null 2>&1; then
+            TARGET="$CUR_ALIAS_VER"
+            if [ "$TARGET" = "0" ]; then
+              TARGET="$NEW_VER"
+            fi
+            aws lambda create-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --function-version "$TARGET"
+          fi
+
+          # Get alias current version (value before CodeDeploy)
+          ALIAS_CUR=$(aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --query "FunctionVersion" --output text)
+          if [ -z "$ALIAS_CUR" ] || [ "$ALIAS_CUR" = "None" ]; then ALIAS_CUR="0"; fi
+
+          # Append Resource block (YAML) to APP_RESOURCES
+          APP_RESOURCES="${APP_RESOURCES}\n  - ${func_name}:\n      Type: AWS::Lambda::Function\n      Properties:\n        Name: ${func_name}\n        Alias: ${LAMBDA_ALIAS}\n        CurrentVersion: ${ALIAS_CUR}\n        TargetVersion: ${NEW_VER}\n"
         done
 
-      - echo "Uploading Glue scripts to S3 and updating jobs..."
-      - mkdir -p build/glue_scripts
-
-      - |
-        for script in glue/*.py; do
-          job_name=$(basename "$script" .py)
-          s3_path="s3://$S3_BUCKET/glue-scripts/${job_name}.py"
-          echo "Uploading $script to $s3_path"
-          aws s3 cp "$script" "$s3_path"
-
-          if aws glue get-job --job-name "$job_name" > /dev/null 2>&1; then
-            echo "Updating existing Glue job: $job_name"
-            aws glue update-job --job-name "$job_name" \
-              --job-update "{\"Command\": {\"Name\": \"glueetl\", \"ScriptLocation\": \"$s3_path\"}}"
-          else
-            echo "Creating new Glue job: $job_name"
-            aws glue create-job \
-              --name "$job_name" \
-              --role "$GLUE_ROLE_ARN" \
-              --command "{\"Name\": \"glueetl\", \"ScriptLocation\": \"$s3_path\"}" \
-              --glue-version "3.0" \
-              --max-capacity 2
-          fi
-        done
+      - echo -e "version: 0.0\nResources:" > appspec.yml
+      - echo -e "$APP_RESOURCES" >> appspec.yml
+      - cat appspec.yml
 
   post_build:
     commands:
-      - echo "=== Deployment Complete ==="
+      - echo "Creating CodeDeploy deployment..."
+      - aws deploy create-deployment --application-name "$CODEDEPLOY_APPLICATION_NAME" --deployment-group-name "$CODEDEPLOY_DEPLOYMENT_GROUP" --description "Deploy from CodeBuild" --appspec-content "file://appspec.yml"
+      - echo "Triggered CodeDeploy"
+artifacts:
+  files:
+    - appspec.yml
