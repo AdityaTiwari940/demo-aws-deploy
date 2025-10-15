@@ -3,7 +3,7 @@ set -e
 
 REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 ROLE_ARN="${LAMBDA_EXEC_ROLE_ARN}"   # IAM role ARN passed via environment variable
-RUNTIME="python3.9"
+RUNTIME="python3.10"
 HANDLER="lambda_function.lambda_handler"
 LAMBDA_ALIAS="${LAMBDA_ALIAS:-live}"
 
