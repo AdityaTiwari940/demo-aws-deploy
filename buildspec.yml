@@ -17,35 +17,40 @@ phases:
 
   build:
     commands:
+      - echo "=== Packaging and Publishing Lambdas ==="
       - mkdir -p build
       - APP_RESOURCES=""
       - |
+        set -e
         for d in lambda/*/ ; do
           func_dir="${d%/}"
           func_name=$(basename "$func_dir")
           echo "Processing $func_name"
 
+          # Install dependencies if present
           if [ -f "$func_dir/requirements.txt" ]; then
             pip install -r "$func_dir/requirements.txt" -t "$func_dir"
           fi
 
+          # Zip the function
           zip_file="build/${func_name}.zip"
-          (cd "$func_dir" && zip -r "../../$zip_file" .) >/dev/null
+          (cd "$func_dir" && zip -r "../../$zip_file" . >/dev/null)
+          echo "Zipped $zip_file"
 
-          # Update code (puts code into $LATEST)
+          # Update Lambda code
           aws lambda update-function-code --function-name "$func_name" --zip-file "fileb://$zip_file" >/tmp/update_${func_name}.json
 
-          # find current alias version (before publish)
+          # Get alias version before publish
           CUR_ALIAS_VER=$(aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --query "FunctionVersion" --output text 2>/dev/null || echo "")
           if [ -z "$CUR_ALIAS_VER" ] || [ "$CUR_ALIAS_VER" = "None" ]; then
             CUR_ALIAS_VER="0"
           fi
 
-          # Publish new version from $LATEST
+          # Publish new version
           NEW_VER=$(aws lambda publish-version --function-name "$func_name" --query "Version" --output text)
           echo "Published $func_name -> $NEW_VER"
 
-          # Ensure alias exists (if not, create it pointing to previous version or new if none)
+          # Ensure alias exists
           if ! aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" >/dev/null 2>&1; then
             TARGET="$CUR_ALIAS_VER"
             if [ "$TARGET" = "0" ]; then
@@ -54,23 +59,28 @@ phases:
             aws lambda create-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --function-version "$TARGET"
           fi
 
-          # Get alias current version (value before CodeDeploy)
+          # Get alias current version
           ALIAS_CUR=$(aws lambda get-alias --function-name "$func_name" --name "$LAMBDA_ALIAS" --query "FunctionVersion" --output text)
           if [ -z "$ALIAS_CUR" ] || [ "$ALIAS_CUR" = "None" ]; then ALIAS_CUR="0"; fi
 
-          # Append Resource block (YAML) to APP_RESOURCES
+          # Append YAML resource block
           APP_RESOURCES="${APP_RESOURCES}\n  - ${func_name}:\n      Type: AWS::Lambda::Function\n      Properties:\n        Name: ${func_name}\n        Alias: ${LAMBDA_ALIAS}\n        CurrentVersion: ${ALIAS_CUR}\n        TargetVersion: ${NEW_VER}\n"
         done
 
-      - echo -e "version: 0.0\nResources:" > appspec.yml
-      - echo -e "$APP_RESOURCES" >> appspec.yml
-      - cat appspec.yml
+        echo -e "version: 0.0\nResources:" > appspec.yml
+        echo -e "$APP_RESOURCES" >> appspec.yml
+        cat appspec.yml
 
   post_build:
     commands:
-      - echo "Creating CodeDeploy deployment..."
-      - aws deploy create-deployment --application-name "$CODEDEPLOY_APPLICATION_NAME" --deployment-group-name "$CODEDEPLOY_DEPLOYMENT_GROUP" --description "Deploy from CodeBuild" --appspec-content "file://appspec.yml"
-      - echo "Triggered CodeDeploy"
+      - echo "=== Creating CodeDeploy deployment ==="
+      - aws deploy create-deployment \
+          --application-name "$CODEDEPLOY_APPLICATION_NAME" \
+          --deployment-group-name "$CODEDEPLOY_DEPLOYMENT_GROUP" \
+          --description "Deploy from CodeBuild" \
+          --appspec-content file://appspec.yml
+      - echo "=== CodeDeploy Triggered Successfully ==="
+
 artifacts:
   files:
     - appspec.yml
